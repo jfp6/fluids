@@ -938,6 +938,189 @@ opening_equal_tck = implementation_optimize_tck([[0.0, 0.0, 0.0, 0.0, 0.09287, 0
         3])
 Cv_char_equal_percentage = lambda opening: float(splev(opening, opening_equal_tck))
 
+def size_control_valve_g_mass(T, MW, mu, gamma, Z, P1, P2, Q, D1=None, D2=None, 
+                         d=None, FL=0.9, Fd=1, xT=0.7, allow_choked=True, 
+                         allow_laminar=True, full_output=False):
+    r'''Calculates flow coefficient of a control valve passing a gas
+    according to IEC 60534. Uses a large number of inputs in SI units. Note the
+    return value is not standard SI. All parameters are required. For details
+    of the calculations, consult [1]_. Note the inlet gas flow conditions.
+
+    Parameters
+    ----------
+    T : float
+        Temperature of the gas at the inlet [K]
+    MW : float
+        Molecular weight of the gas [g/mol]
+    mu : float
+        Viscosity of the fluid at inlet conditions [Pa*s]
+    gamma : float
+        Specific heat capacity ratio [-]
+    Z : float
+        Compressibility factor at inlet conditions, [-]
+    P1 : float
+        Inlet pressure of the gas before valves and reducers [Pa]
+    P2 : float
+        Outlet pressure of the gas after valves and reducers [Pa]
+    Q : float
+        Volumetric flow rate of the gas at *273.15 K* and 1 atm specifically
+        [m^3/s]
+    D1 : float, optional
+        Diameter of the pipe before the valve [m]
+    D2 : float, optional
+        Diameter of the pipe after the valve [m]
+    d : float, optional
+        Diameter of the valve [m]        
+    FL : float, optional
+        Liquid pressure recovery factor of a control valve without attached 
+        fittings (normally 0.8-0.9 at full open and decreasing as opened 
+        further to below 0.5; use default very cautiously!) []
+    Fd : float, optional
+        Valve style modifier (0.1 to 1; varies tremendously depending on the
+        type of valve and position; do not use the default at all!) []
+    xT : float, optional
+        Pressure difference ratio factor of a valve without fittings at choked
+        flow (increasing to 0.9 or higher as the valve is closed further and 
+        decreasing to 0.1 or lower as the valve is opened further; use default
+        very cautiously!) [-]
+    allow_choked : bool, optional
+        Overrides the automatic transition into the choked regime if this is
+        False and returns as if choked flow does not exist
+    allow_laminar : bool, optional
+        Overrides the automatic transition into the laminar regime if this is
+        False and returns as if laminar flow does not exist
+    full_output : bool, optional
+        If True, returns intermediate calculation values as
+        well as Kv in the form of a dictionary containing 'Kv', 'Rev', 'choked',
+        'Y', 'FR', 'FP', 'xTP', and 'laminar'. Some may be None if they are 
+        not used in the calculation.
+        
+    Returns
+    -------
+    Kv : float
+        Metric Kv valve flow coefficient (flow rate of water at a pressure drop  
+        of 1 bar) [m^3/hr]
+
+    Notes
+    -----
+    It is possible to use this model without any diameters specified; in that
+    case, turbulent flow is assumed. Choked flow can still be modeled. This is
+    not recommended. All three diameters need to be None for this to work.
+    `FL` and `Fd` are not used by the models when the diameters are not 
+    specified, but `xT` definitely is used by the model.
+    
+    Examples
+    --------
+    From [1]_, matching example 3 for non-choked gas flow with attached
+    fittings  and a rotary, eccentric plug, flow-to-open control valve:
+
+    >>> size_control_valve_g(T=433., MW=44.01, mu=1.4665E-4, gamma=1.30,
+    ... Z=0.988, P1=680E3, P2=310E3, Q=38/36., D1=0.08, D2=0.1, d=0.05,
+    ... FL=0.85, Fd=0.42, xT=0.60)
+    72.58664545391052
+
+    From [1]_, roughly matching example 4 for a small flow trim sized tapered
+    needle plug valve. Difference is 3% and explained by the difference in
+    algorithms used.
+
+    >>> size_control_valve_g(T=320., MW=39.95, mu=5.625E-5, gamma=1.67, Z=1.0,
+    ... P1=2.8E5, P2=1.3E5, Q=0.46/3600., D1=0.015, D2=0.015, d=0.015, FL=0.98,
+    ... Fd=0.07, xT=0.8)
+    0.016498765335995726
+
+    References
+    ----------
+    .. [1] IEC 60534-2-1 / ISA-75.01.01-2007
+    '''
+    MAX_C_POSSIBLE = 1E40 # Quit iterations if C reaches this high
+    # Pa to kPa, according to constants in standard
+    P1, P2 = P1/1000., P2/1000.
+    Q = Q*3600. # m^3/s to m^3/hr, according to constants in standard
+    # Convert dynamic viscosity to kinematic viscosity
+    Vm = Z*R*T/(P1*1000)
+    rho = (Vm)**-1*MW/1000.
+    nu = mu/rho # kinematic viscosity used in standard
+
+    dP = P1 - P2
+    Fgamma = gamma/1.40
+    x = dP/P1
+    Y = max(1 - x/(3*Fgamma*xT), 2/3.)
+
+    choked = is_choked_turbulent_g(x, Fgamma, xT)
+    if choked and allow_choked:
+        # Choked, and flow coefficient from eq 14a
+        C = Q/(N9*P1*Y)*(MW*T*Z/xT/Fgamma)**0.5
+    else:
+        # Non-choked, and flow coefficient from eq 8a
+        C = Q/(N9*P1*Y)*(MW*T*Z/x)**0.5
+
+
+    if full_output:
+        ans = {'FP': None, 'xTP': None, 'FR': None, 
+               'choked': choked, 'Y': Y}
+
+    if D1 is None and D2 is None and d is None:
+        # Assume turbulent if no diameters are provided, no other calculations
+        Rev = 1e5
+        if full_output:
+            ans['Rev'] = None
+    else:
+        # m to mm, according to constants in standard
+        D1, D2, d = D1*1000., D2*1000., d*1000. # Convert diameters to mm which is used in the standard
+        Rev = Reynolds_valve(nu=nu, Q=Q, D1=D1, FL=FL, Fd=Fd, C=C)
+        if full_output:
+            ans['Rev'] = Rev
+
+        if (Rev > 10000 or not allow_laminar) and (D1 != d or D2 != d):
+            # gas, using xTP and FLP
+            FP = 1.
+            MAX_ITER = 20
+            def iterate_piping_coef(Ci, iterations):
+                loss = loss_coefficient_piping(d, D1, D2)
+                FP = (1. + loss/N2*(Ci/d**2)**2)**-0.5
+                loss_upstream = loss_coefficient_piping(d, D1)
+                xTP = xT/FP**2/(1 + xT*loss_upstream/N5*(Ci/d**2)**2)
+                choked = is_choked_turbulent_g(x, Fgamma, xTP=xTP)
+                if choked:
+                    # Choked flow with piping, equation 17a
+                    C = Q/(N9*FP*P1*Y)*(MW*T*Z/xTP/Fgamma)**0.5
+                else:
+                    # Non-choked flow with piping, equation 11a
+                    C = Q/(N9*FP*P1*Y)*(MW*T*Z/x)**0.5
+                if Ci/C < 0.99 and iterations < MAX_ITER and Ci < MAX_C_POSSIBLE:
+                    C = iterate_piping_coef(C, iterations+1)
+                if full_output:
+                    ans['xTP'] = xTP
+                    ans['FP'] = FP
+                    ans['choked'] = choked
+                    if MAX_ITER == iterations or Ci >= MAX_C_POSSIBLE:
+                        ans['warning'] = 'Not converged in inner loop'
+                return C
+            C = iterate_piping_coef(C, 0)
+        elif Rev <= 10000 and allow_laminar:
+            # Laminar;
+            def iterate_piping_laminar(C):
+                Ci = 1.3*C
+                Rev = Reynolds_valve(nu=nu, Q=Q, D1=D1, FL=FL, Fd=Fd, C=Ci)
+                if Ci/d**2 > 0.016*N18:
+                    FR = Reynolds_factor(FL=FL, C=Ci, d=d, Rev=Rev, full_trim=False)
+                else:
+                    FR = Reynolds_factor(FL=FL, C=Ci, d=d, Rev=Rev, full_trim=True)
+                if C/FR >= Ci:
+                    Ci = iterate_piping_laminar(Ci)
+                if full_output:
+                    ans['FR'] = FR
+                    ans['Rev'] = Rev
+                return Ci
+            C = iterate_piping_laminar(C)
+    if full_output:
+        ans['Kv'] = C
+        ans['laminar'] = Rev <= 10000
+        return ans
+    else:
+        return C
+
+
 
 def convert_flow_coefficient(flow_coefficient, old_scale, new_scale):
     '''Convert from one flow coefficient scale to another; supports the `Kv`
